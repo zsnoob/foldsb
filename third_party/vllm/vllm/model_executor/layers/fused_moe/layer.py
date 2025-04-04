@@ -407,6 +407,7 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        self.cu_tokens_across_dp_cpu = None
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
@@ -757,6 +758,52 @@ class FusedMoE(torch.nn.Module):
         else:
             return torch.ops.vllm.moe_forward(hidden_states, router_logits,
                                               self.layer_name)
+        
+    # TODO: pipeline cache impl, then change the args
+    def dispatch(self, hidden_states: torch.Tensor,
+                router_logits: torch.Tensor):
+        if self.dp_size > 1:
+            self.cu_tokens_across_dp_cpu = get_forward_context(
+            ).dp_metadata.cu_tokens_across_dp_cpu
+
+            hidden_states = self.naive_multicast(hidden_states,
+                                                 self.cu_tokens_across_dp_cpu)
+            router_logits = self.naive_multicast(router_logits,
+                                                 self.cu_tokens_across_dp_cpu)
+
+    def MoEFwd(self, hidden_states: torch.Tensor,
+                router_logits: torch.Tensor):
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_map,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias,
+            activation=self.activation,
+        )
+        
+    def combine(self, final_hidden_states: torch.Tensor):
+        if self.dp_size > 1:
+            start = 0 if self.dp_rank == 0 else self.cu_tokens_across_dp_cpu[
+                self.dp_rank - 1]
+            end = self.cu_tokens_across_dp_cpu[self.dp_rank]
+
+            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+            final_hidden_states = all_hidden_states[start:end, :]
+
+        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+            # Default set to False. (May have to add shared expert outputs.)
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
 
     def forward_impl(self, hidden_states: torch.Tensor,
                      router_logits: torch.Tensor):

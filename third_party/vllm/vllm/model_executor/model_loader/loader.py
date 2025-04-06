@@ -422,11 +422,12 @@ class DefaultModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(vllm_config=vllm_config)
 
+            weights_to_load = {name for name, _ in model.named_parameters()}
+
             # edit
             weights_to_exclude = {"model.norm.weight", "lm_head.weight"}
             weights_to_load = weights_to_load - weights_to_exclude
 
-            weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(model_config, model))
             self.counter_after_loading_weights = time.perf_counter()

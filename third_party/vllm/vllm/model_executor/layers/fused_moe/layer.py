@@ -771,6 +771,8 @@ class FusedMoE(torch.nn.Module):
             router_logits = self.naive_multicast(router_logits,
                                                  self.cu_tokens_across_dp_cpu)
 
+        return hidden_states, router_logits
+    
     def MoEFwd(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
         final_hidden_states = self.quant_method.apply(
@@ -789,6 +791,8 @@ class FusedMoE(torch.nn.Module):
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
         )
+
+        return final_hidden_states
         
     def combine(self, final_hidden_states: torch.Tensor):
         if self.dp_size > 1:
@@ -804,6 +808,7 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
+        return final_hidden_states
 
     def forward_impl(self, hidden_states: torch.Tensor,
                      router_logits: torch.Tensor):

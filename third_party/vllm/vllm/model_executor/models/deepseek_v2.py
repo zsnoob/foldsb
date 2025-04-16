@@ -25,6 +25,7 @@
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
+import os
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -56,6 +57,9 @@ from .interfaces import SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+
+PIPE_ON = os.getenv('PIPE_ON', '0') == '1'
 
 
 class DeepseekV2MLP(nn.Module):
@@ -148,27 +152,6 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    # TODO: decouple and cache impl
-    def gating(self, hidden_states: torch.Tensor):
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-    
-    def post_MoE(self):
-        if shared_output is not None:
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = final_hidden_states + shared_output
-            else:
-                # This is a special case to avoid FP16 overflow
-                final_hidden_states = final_hidden_states + shared_output \
-                    * (1. / self.routed_scaling_factor)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -184,6 +167,68 @@ class DeepseekV2MoE(nn.Module):
             # This is a special case to avoid FP16 overflow
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
+        if self.n_shared_experts is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # This is a special case to avoid FP16 overflow
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class PipeDeepseekV2MoE(DeepseekV2MoE):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config, quant_config, prefix)
+        self.moe_pipe_degree = int(os.getenv('PIPE_DEGREE', '1'))
+        self._cache = [{} for _ in range(self.moe_pipe_degree)]
+
+    def gating(self, hidden_states: torch.Tensor, chunk_idx: int):
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_output = self.shared_experts(hidden_states) if self.n_shared_experts is not None else None
+        router_logits, _ = self.gate(hidden_states)
+        self._cache[chunk_idx]['hidden_states'] = hidden_states
+        self._cache[chunk_idx]['router_logits'] = router_logits
+        self._cache[chunk_idx]['shared_output'] = shared_output
+
+    def dispatch(self, chunk_idx: int):
+        hidden_states = self._cache[chunk_idx]['hidden_states']
+        router_logits = self._cache[chunk_idx]['router_logits']
+        dispatched_hidden_states, dispatched_router_logits = self.experts.dispatch(hidden_states, router_logits)
+        self._cache[chunk_idx]['dispatched_states'] = dispatched_hidden_states
+        self._cache[chunk_idx]['dispatched_router_logits'] = dispatched_router_logits
+
+    def MoEFwd(self, chunk_idx: int):
+        dispatched_states = self._cache[chunk_idx]['dispatched_states']
+        router_logits = self._cache[chunk_idx]['dispatched_router_logits']
+        self._cache[chunk_idx]['moe_output'] = self.experts.MoEFwd(dispatched_states, router_logits)
+
+    def combine(self, chunk_idx: int):
+        moe_output = self._cache[chunk_idx]['moe_output']
+        hidden_states = self._cache[chunk_idx]['hidden_states']  
+        # Get hidden_states to check dtype
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts.combine(moe_output) * self.routed_scaling_factor
+        else:
+            # This is a special case to avoid FP16 overflow
+            final_hidden_states = self.experts.combine(moe_output)
+        self._cache[chunk_idx]['final_hidden_states'] = final_hidden_states
+
+    def post_MoE(self, chunk_idx: int):
+        final_hidden_states = self._cache[chunk_idx]['final_hidden_states']
+        shared_output = self._cache[chunk_idx]['shared_output']
+        hidden_states = self._cache[chunk_idx]['hidden_states']
+        num_tokens, hidden_dim = hidden_states.shape
         if shared_output is not None:
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
@@ -196,6 +241,14 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        chunk_idx = 0
+        self.gating(hidden_states, chunk_idx)
+        self.dispatch(chunk_idx)
+        self.MoEFwd(chunk_idx)
+        self.combine(chunk_idx)
+        return self.post_MoE(chunk_idx)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -598,6 +651,83 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str,
+        model_config: ModelConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+
+        super().__init__(config, prefix, model_config, cache_config, quant_config)
+
+        # Then explicitly replace the MoE layer with PipeDeepseekV2MoE when needed
+        layer_idx = int(prefix.split(sep='.')[-1])
+        if (config.n_routed_experts is not None
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0):
+            self.mlp = PipeDeepseekV2MoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+           
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        
+        moe_input_buffer = torch.empty_like(hidden_states)
+        moe_layer = self.mlp
+
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+
+        
+
+        # Fully Connected
+        if isinstance(self.mlp, PipeDeepseekV2MoE) and \
+            hidden_states.dtype == torch.float16:
+            # This is a special case to avoid FP16 overflow
+            hidden_states *= 1. / self.routed_scaling_factor
+
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+
+        if isinstance(self.mlp, PipeDeepseekV2MoE) and PIPE_ON:
+            # FoldInfer
+            moe_inputs = hidden_states
+            chunk_idx = 0  # You can pass different chunk_idx based on the pipeline
+
+            moe_layer.gating(moe_inputs, chunk_idx)
+            moe_layer.dispatch(chunk_idx)
+            moe_layer.MoEFwd(chunk_idx)
+            moe_layer.combine(chunk_idx)
+            hidden_states = moe_layer.post_MoE(chunk_idx)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
+        if isinstance(self.mlp, DeepseekV2MLP) and \
+            hidden_states.dtype == torch.float16:
+            # This is a special case to avoid FP16 overflow
+            hidden_states *= 1. / self.routed_scaling_factor
+            residual *= 1. / self.routed_scaling_factor
+        return hidden_states, residual
+
+
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
 
@@ -606,10 +736,12 @@ class DeepseekV2Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
+        # Extract configuration early to avoid recomputing during tracing
         config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        # use_pipe = PIPE_ON
 
         self.vocab_size = config.vocab_size
 
@@ -624,7 +756,7 @@ class DeepseekV2Model(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(
+            lambda prefix: PipeDeepseekV2DecoderLayer(
                 config,
                 prefix,
                 model_config=model_config,

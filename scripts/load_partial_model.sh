@@ -1,16 +1,14 @@
 #!/bin/bash
 
-
 # Clone model repo without large files
 GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/deepseek-ai/DeepSeek-V3
 cd DeepSeek-V3
 
-# Clear params pointers 
+# Clear params pointers
 rm model-00*
 
 # We need use bf16 dtype, download fp8 params in a folder
-mkdir fp8
-cd fp8
+mkdir fp8 && cd fp8
 
 # Load first three MLP layers + single MoE layer
 wget https://huggingface.co/deepseek-ai/DeepSeek-V3/resolve/main/model-00001-of-000163.safetensors

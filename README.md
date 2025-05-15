@@ -1,9 +1,10 @@
 # Installation
 
 ```bash
-VLLM_USE_PRECOMPILED=1 pip install -e third_party/vllm # This step might take a while
-# TODO: No sure why `torch-2.6.0-cp312-cp312-manylinux1_x86_64.whl` is downloaded again even inside docker container `nvcr.io/nvidia/pytorch:24.12-py3`
+# https://github.com/vllm-project/vllm/issues/12577#issuecomment-2757027368
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://files.pythonhosted.org/packages/15/77/7beca2061aadfdfd2d81411102e6445b459bcfedfc46671d4712de6a00fb/vllm-0.8.0-cp38-abi3-manylinux1_x86_64.whl
 
+VLLM_USE_PRECOMPILED=1 pip install -e third_party/vllm # This step might take a while
 ```
 
 ## Error
@@ -24,5 +25,15 @@ python --version
 wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 
 pip install workspace/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+```
+
+# Run
+
+Can run on 4 RTX4090(24GB).
+
+```bash
+srun --nodes=1 --gpus=4 --mail-type=ALL --pty bash
+
+python workspace/prof.py
 ```
 

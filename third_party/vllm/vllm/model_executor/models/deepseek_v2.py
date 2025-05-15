@@ -214,6 +214,11 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
         self._cache[chunk_idx]['moe_output'] = self.experts.MoEFwd(dispatched_states, router_logits)
 
     def combine(self, chunk_idx: int):
+        """A2A-combine.
+        
+        Call FusedMoE.combine().
+        Combine the dispatched MoE outputs, and apply scaling factor if needed.
+        """
         moe_output = self._cache[chunk_idx]['moe_output']
         hidden_states = self._cache[chunk_idx]['hidden_states']  
         # Get hidden_states to check dtype
@@ -224,7 +229,11 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
             final_hidden_states = self.experts.combine(moe_output)
         self._cache[chunk_idx]['final_hidden_states'] = final_hidden_states
 
-    def post_MoE(self, chunk_idx: int):
+    def post_MoE(self, chunk_idx: int) -> torch.Tensor:
+        """Post-processing after A2A-combine.
+        
+        Adding shared expert outputs, and allreduce in TP group (if applicable).
+        """
         final_hidden_states = self._cache[chunk_idx]['final_hidden_states']
         shared_output = self._cache[chunk_idx]['shared_output']
         hidden_states = self._cache[chunk_idx]['hidden_states']

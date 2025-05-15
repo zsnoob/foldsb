@@ -735,10 +735,19 @@ class FusedMoE(torch.nn.Module):
 
     def naive_multicast(self, x: torch.Tensor,
                         cu_tokens_across_dp_cpu: torch.Tensor):
+        """Naive implementation of all-to-all using allgather (emulated by multiple broadcasts).
+
+        Args:
+            x (torch.Tensor): [local_bs, hidden_size], tokens to communicate
+            cu_tokens_across_dp_cpu (torch.Tensor): [n_dp_ranks], accumulated number of tokens on each dp rank
+
+        Returns:
+            buffer (torch.Tensor): [global_bs, hidden_size], tokens on all dp ranks (ie. global_bs = local_bs * n_dp_ranks)
+        """
         assert (len(x.shape) == 2)
         buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
                              device=x.device,
-                             dtype=x.dtype)
+                             dtype=x.dtype) # comm buffer for tokens on all dp ranks
 
         start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
             self.dp_rank - 1]
@@ -748,6 +757,7 @@ class FusedMoE(torch.nn.Module):
             start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
             end = cu_tokens_across_dp_cpu[idx]
             get_dp_group().broadcast(buffer[start:end, :], idx)
+            # torch.distributed.broadcast() is invoked under the hood
 
         return buffer
 

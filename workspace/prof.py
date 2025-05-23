@@ -1,8 +1,8 @@
 from vllm import LLM
 
 
-llm = LLM(model="/your/path/to/DeepSeek-V3",
-        trust_remote_code=True, tensor_parallel_size=4, 
+llm = LLM(model="../scripts/DeepSeek-V3",
+        trust_remote_code=True, tensor_parallel_size=2, 
         enable_expert_parallel=True, enforce_eager=True)
 
 

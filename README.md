@@ -5,6 +5,12 @@
 export VLLM_PRECOMPILED_WHEEL_LOCATION=https://files.pythonhosted.org/packages/15/77/7beca2061aadfdfd2d81411102e6445b459bcfedfc46671d4712de6a00fb/vllm-0.8.0-cp38-abi3-manylinux1_x86_64.whl
 
 VLLM_USE_PRECOMPILED=1 pip install -e third_party/vllm # This step might take a while
+
+
+# For vllm 0.8.5, you need re-install the newer precompiled wheel
+export https://wheels.vllm.ai/ba41cc90e8ef7f236347b2f1599eec2cbb9e1f0d/vllm-0.8.5-cp38-abi3-manylinux1_x86_64.whl
+
+pip install -e third_party/vllm
 ```
 
 ## Error

@@ -32,9 +32,8 @@ if current_platform.is_tpu():
     from .moe_torch_iterative import fused_moe as fused_moe_pallas
 else:
     fused_moe_pallas = None  # type: ignore
+import nvtx
 logger = init_logger(__name__)
-
-import torch.cuda.nvtx as nvtx
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -856,8 +855,9 @@ class FusedMoE(torch.nn.Module):
     # TODO: pipeline cache impl, then change the args
     def dispatch(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_push("FusedMoE dispatch")
         if self.dp_size > 1:
-            nvtx.range_push("FusedMoE multicast")
             self.cu_tokens_across_dp_cpu = get_forward_context(
             ).dp_metadata.cu_tokens_across_dp_cpu
 
@@ -865,7 +865,8 @@ class FusedMoE(torch.nn.Module):
                                                  self.cu_tokens_across_dp_cpu)
             router_logits = self.naive_multicast(router_logits,
                                                  self.cu_tokens_across_dp_cpu)
-            nvtx.range_pop()
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_pop()
 
         return hidden_states, router_logits
     
@@ -891,6 +892,8 @@ class FusedMoE(torch.nn.Module):
         return final_hidden_states
         
     def combine(self, final_hidden_states: torch.Tensor):
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_push("FusedMoE combine")
         if self.dp_size > 1:
             start = 0 if self.dp_rank == 0 else self.cu_tokens_across_dp_cpu[
                 self.dp_rank - 1]
@@ -903,6 +906,8 @@ class FusedMoE(torch.nn.Module):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_pop()
 
         return final_hidden_states
 

@@ -609,7 +609,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = DeepseekV2MoE(
+            self.mlp = PipeDeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
@@ -675,15 +675,15 @@ class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         super().__init__(config, prefix, model_config, cache_config, quant_config)
 
         # Then explicitly replace the MoE layer with PipeDeepseekV2MoE when needed
-        layer_idx = int(prefix.split(sep='.')[-1])
-        if (config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = PipeDeepseekV2MoE(
-                config=config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
-            )
+        # layer_idx = int(prefix.split(sep='.')[-1])
+        # if (config.n_routed_experts is not None
+        #         and layer_idx >= config.first_k_dense_replace
+        #         and layer_idx % config.moe_layer_freq == 0):
+        #     self.mlp = PipeDeepseekV2MoE(
+        #         config=config,
+        #         quant_config=quant_config,
+        #         prefix=f"{prefix}.mlp",
+        #     )
            
     def forward(
         self,

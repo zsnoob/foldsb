@@ -2,3 +2,5 @@ __pycache__/
 DeepSeek-V3/
 
 *.whl
+*.nsys-rep
+test.sh

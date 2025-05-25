@@ -59,7 +59,7 @@ def parse_args():
                         help="Rank of the current node")
     parser.add_argument("--master-addr",
                         type=str,
-                        default="",
+                        default="127.0.0.1",
                         help="Master node IP address")
     parser.add_argument("--master-port",
                         type=int,
@@ -123,8 +123,7 @@ def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
               trust_remote_code=True,
               tensor_parallel_size=GPUs_per_dp_rank,
               enforce_eager=True,
-              enable_expert_parallel=True,
-              distributed_executor_backend="ray")
+              enable_expert_parallel=True)
     
     outputs = llm.generate(prompts, sampling_params)
     

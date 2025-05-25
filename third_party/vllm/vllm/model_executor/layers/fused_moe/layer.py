@@ -34,6 +34,8 @@ else:
     fused_moe_pallas = None  # type: ignore
 logger = init_logger(__name__)
 
+import torch.cuda.nvtx as nvtx
+
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -855,6 +857,7 @@ class FusedMoE(torch.nn.Module):
     def dispatch(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
         if self.dp_size > 1:
+            nvtx.range_push("FusedMoE multicast")
             self.cu_tokens_across_dp_cpu = get_forward_context(
             ).dp_metadata.cu_tokens_across_dp_cpu
 
@@ -862,6 +865,7 @@ class FusedMoE(torch.nn.Module):
                                                  self.cu_tokens_across_dp_cpu)
             router_logits = self.naive_multicast(router_logits,
                                                  self.cu_tokens_across_dp_cpu)
+            nvtx.range_pop()
 
         return hidden_states, router_logits
     

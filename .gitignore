@@ -1,5 +1,10 @@
 __pycache__/
 DeepSeek-V3/
+third_party/vllm/examples/
+CLAUDE.md
+third_party/CLAUDE.md
+*.txt
+*.pt
 
 *.whl
 *.nsys-rep

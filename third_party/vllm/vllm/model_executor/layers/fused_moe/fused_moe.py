@@ -1265,6 +1265,12 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     ]
 
     num_tokens, _ = hidden_states.shape
+    # check if params are reasonable
+    print(f"num_tokens: {num_tokens}, "
+          f"hidden_states.shape: {hidden_states.shape}, "
+          f"w1.shape: {w1.shape}, w2.shape: {w2.shape}, "
+          f"topk_weights.shape: {topk_weights.shape}, "
+          f"topk_ids.shape: {topk_ids.shape}")
     E, N, _ = w1.shape
     K = w2.shape[1]
     if global_num_experts == -1:

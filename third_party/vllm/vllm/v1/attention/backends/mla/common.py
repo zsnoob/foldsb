@@ -355,8 +355,7 @@ class MLACommonMetadataBuilder(Generic[M]):
         self.aot_schedule = is_vllm_fa and (get_flash_attn_version() == 3)
 
         # Dont try to access the runner on AMD
-        if self.aot_schedule:
-            self.page_size = self.runner.block_size
+        self.page_size = self.runner.block_size
 
         if self.chunked_prefill_enabled:
             self.chunked_prefill_workspace_size = min(
@@ -889,6 +888,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def pad_chunk_to_alignment(self, chunk, alignment=32):
+        seq_len = chunk.shape[0]  # 一维数组只有一个维度
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            padding = torch.zeros(padding_size, dtype=chunk.dtype, device=chunk.device)
+            chunk = torch.cat([chunk, padding], dim=0)  # 一维concat
+        return chunk, seq_len
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -898,6 +907,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         kv_cache: torch.Tensor,
         attn_metadata: M,
         output: Optional[torch.Tensor] = None,
+        chunk_id: Optional[int] = None,
+        moe_pipe_degree: Optional[int] = None,
     ) -> torch.Tensor:
 
         assert output is not None, "Output tensor must be provided."
@@ -943,13 +954,76 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if has_prefill:
             assert attn_metadata.prefill is not None
-            prefill_q = self.q_proj(prefill_hs_or_q_c)[0]\
-                .view(-1, self.num_heads, self.qk_head_dim)
-            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
-
-            prefill_q_pe[...], prefill_k_pe[...] = self.rotary_emb(
-                attn_metadata.prefill.input_positions,
-                prefill_q_pe.contiguous(), prefill_k_pe)
+            
+            # Handle chunked prefill for pipeline
+            if chunk_id is not None and moe_pipe_degree is not None:
+                # Calculate chunk boundaries with proper handling of non-divisible seq_len
+                total_prefill_tokens = prefill_hs_or_q_c.shape[0]
+                chunk_size = cdiv(total_prefill_tokens, moe_pipe_degree)
+                start_idx = min(chunk_id * chunk_size, total_prefill_tokens)
+                end_idx = min((chunk_id + 1) * chunk_size, total_prefill_tokens)
+                
+                # Extract chunk data
+                chunk_hs_or_q_c = prefill_hs_or_q_c[start_idx:end_idx]
+                chunk_k_pe = prefill_k_pe[start_idx:end_idx]
+                chunk_k_c_normed = prefill_k_c_normed[start_idx:end_idx]
+                
+                # Get position embeddings for this chunk
+                chunk_len = end_idx - start_idx
+                pe_chunks = attn_metadata.prefill.input_positions[start_idx:end_idx]
+                
+                # Compute Q projection for chunk
+                prefill_q = self.q_proj(chunk_hs_or_q_c)[0]\
+                    .view(-1, self.num_heads, self.qk_head_dim)
+                prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
+                
+                # Create chunk-specific metadata
+                chunk_metadata = type(attn_metadata.prefill)(
+                    input_positions=pe_chunks,
+                    block_table=attn_metadata.prefill.block_table,
+                    query_start_loc=torch.tensor([0, chunk_len], 
+                                                device=attn_metadata.prefill.query_start_loc.device, 
+                                                dtype=attn_metadata.prefill.query_start_loc.dtype),
+                    max_query_len=chunk_len,
+                    chunked_context=None,  # Disable chunked context for pipeline chunks
+                )
+                
+                # Create chunk-specific attention metadata
+                chunk_attn_metadata = type(attn_metadata)(
+                    num_actual_tokens=chunk_len,
+                    query_start_loc=chunk_metadata.query_start_loc,
+                    slot_mapping=attn_metadata.slot_mapping[num_decode_tokens + start_idx:num_decode_tokens + end_idx],
+                    head_dim=attn_metadata.head_dim,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=chunk_metadata,
+                    decode=None,
+                )
+                
+                # Apply rotary embeddings to chunk with adjusted positions
+                # Adjust position embeddings for chunk offset to maintain global consistency
+                chunk_positions = pe_chunks - pe_chunks[0] + start_idx
+                prefill_q_pe[...], chunk_k_pe[...] = self.rotary_emb(
+                    chunk_positions, prefill_q_pe.contiguous(), chunk_k_pe)
+                
+                print(prefill_q.size(), chunk_k_c_normed.size(), chunk_k_pe.size(), kv_cache.size())
+                # Compute attention for chunk
+                chunk_output = self._forward_prefill(
+                    prefill_q, chunk_k_c_normed, chunk_k_pe, kv_cache,
+                    chunk_attn_metadata)
+                
+                return chunk_output
+            
+            else:
+                # Standard non-chunked prefill
+                prefill_q = self.q_proj(prefill_hs_or_q_c)[0]\
+                    .view(-1, self.num_heads, self.qk_head_dim)
+                prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
+                
+                prefill_q_pe[...], prefill_k_pe[...] = self.rotary_emb(
+                    attn_metadata.prefill.input_positions,
+                    prefill_q_pe.contiguous(), prefill_k_pe)
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:

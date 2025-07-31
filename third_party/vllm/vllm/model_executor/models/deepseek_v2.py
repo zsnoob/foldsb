@@ -32,7 +32,8 @@ from transformers import PretrainedConfig
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.distributed import (get_pp_group,
+from vllm.distributed import (get_pp_group, get_dp_group, 
+                              get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -189,14 +190,15 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
-        self.moe_pipe_degree = int(os.getenv('PIPE_DEGREE', '1'))
+        self.moe_pipe_degree = config.moe_pipe_degree
         self._cache = [{} for _ in range(self.moe_pipe_degree)]
 
-    def gating(self, hidden_states: torch.Tensor, chunk_idx: int):
+    def gating(self, hidden_states: torch.Tensor, residual: torch.Tensor, chunk_idx: int):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = self.shared_experts(hidden_states) if self.n_shared_experts is not None else None
         router_logits, _ = self.gate(hidden_states)
+        self._cache[chunk_idx]['residual'] = residual
         self._cache[chunk_idx]['hidden_states'] = hidden_states
         self._cache[chunk_idx]['router_logits'] = router_logits
         self._cache[chunk_idx]['shared_output'] = shared_output
@@ -204,14 +206,49 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
     def dispatch(self, chunk_idx: int):
         hidden_states = self._cache[chunk_idx]['hidden_states']
         router_logits = self._cache[chunk_idx]['router_logits']
+        print(f"chunk_idx: {chunk_idx}, hidden_states.shape: {hidden_states.shape}, router_logits.shape: {router_logits.shape}")
         dispatched_hidden_states, dispatched_router_logits = self.experts.dispatch(hidden_states, router_logits)
+        print(f"chunk_idx: {chunk_idx}, dispatched_hidden_states.shape: {dispatched_hidden_states.shape}, dispatched_router_logits.shape: {dispatched_router_logits.shape}")
         self._cache[chunk_idx]['dispatched_states'] = dispatched_hidden_states
         self._cache[chunk_idx]['dispatched_router_logits'] = dispatched_router_logits
 
+    def pad_chunk_to_alignment(self, chunk, alignment=32):
+        seq_len, hidden_size = chunk.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            padding = torch.zeros(padding_size, hidden_size, 
+                                dtype=chunk.dtype, device=chunk.device)
+            chunk = torch.cat([chunk, padding], dim=0)
+        
+        return chunk, seq_len
+    
+    def pad_router_logits_safe(self, router_logits, alignment=32):
+        seq_len, num_experts = router_logits.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            
+            padding = torch.full((padding_size, num_experts), 
+                            -1e4, 
+                            dtype=router_logits.dtype, 
+                            device=router_logits.device)
+            router_logits = torch.cat([router_logits, padding], dim=0)
+    
+        return router_logits, seq_len
+    
     def MoEFwd(self, chunk_idx: int):
         dispatched_states = self._cache[chunk_idx]['dispatched_states']
         router_logits = self._cache[chunk_idx]['dispatched_router_logits']
-        self._cache[chunk_idx]['moe_output'] = self.experts.MoEFwd(dispatched_states, router_logits)
+        
+        #dispatched_states, original_len = self.pad_chunk_to_alignment(dispatched_states, 32)
+        #router_logits, _ = self.pad_router_logits_safe(router_logits, 32)
+
+        moe_output = self.experts.MoEFwd(dispatched_states, router_logits)
+        self._cache[chunk_idx]['moe_output'] = moe_output
+        #self._cache[chunk_idx]['moe_output'] = moe_output[:original_len, :]
 
     def combine(self, chunk_idx: int):
         """A2A-combine.
@@ -238,12 +275,40 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
         shared_output = self._cache[chunk_idx]['shared_output']
         hidden_states = self._cache[chunk_idx]['hidden_states']
         num_tokens, hidden_dim = hidden_states.shape
-        if shared_output is not None:
+        if self.n_shared_experts is not None:
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
             else:
                 # Fix FP16 overflow
-                # See DeepseekV2DecoderLayer for more details.
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim), self._cache[chunk_idx]['residual']
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits) * self.routed_scaling_factor
+        else:
+            # Fix FP16 overflow
+            # See DeepseekV2DecoderLayer for more details.
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                               router_logits=router_logits)
+        if self.n_shared_experts is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # This is a special case to avoid FP16 overflow
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
         if self.tp_size > 1:
@@ -251,14 +316,6 @@ class PipeDeepseekV2MoE(DeepseekV2MoE):
                 final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        chunk_idx = 0
-        self.gating(hidden_states, chunk_idx)
-        self.dispatch(chunk_idx)
-        self.MoEFwd(chunk_idx)
-        self.combine(chunk_idx)
-        return self.post_MoE(chunk_idx)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -563,6 +620,27 @@ class DeepseekV2MLAAttention(nn.Module):
                              k_pe,
                              output_shape=hidden_states.shape)
 
+    def forward_chunk(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        chunk_id: Optional[int] = None,
+        moe_pipe_degree: Optional[int] = None,
+    ) -> torch.Tensor:
+        if self.q_lora_rank is not None:
+            ckq = self.q_a_proj(hidden_states)[0]
+            hidden_states_or_q_c = self.q_a_layernorm(ckq)
+        else:
+            hidden_states_or_q_c = hidden_states
+        kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        return self.mla_attn.forward_chunk(hidden_states_or_q_c,
+                             kv_c_normed,
+                             k_pe,
+                             output_shape=hidden_states.shape,
+                             chunk_id=chunk_id,
+                             moe_pipe_degree=moe_pipe_degree)
 
 class DeepseekV2DecoderLayer(nn.Module):
 
@@ -673,6 +751,12 @@ class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     ) -> None:
 
         super().__init__(config, prefix, model_config, cache_config, quant_config)
+        if isinstance(self.mlp, PipeDeepseekV2MoE):
+            # two stream for computation and communication
+            self.streams = [torch.cuda.Stream() for _ in range(2)]
+            # event for correct synchronization
+            self.events = [torch.cuda.Event()
+                           for _ in range(self.mlp.moe_pipe_degree)] * 4
 
         # Then explicitly replace the MoE layer with PipeDeepseekV2MoE when needed
         # layer_idx = int(prefix.split(sep='.')[-1])
@@ -684,6 +768,17 @@ class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         #         quant_config=quant_config,
         #         prefix=f"{prefix}.mlp",
         #     )
+    def pad_chunk_to_alignment(self, chunk, alignment=32):
+        seq_len, hidden_size = chunk.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            padding = torch.zeros(padding_size, hidden_size, 
+                                dtype=chunk.dtype, device=chunk.device)
+            chunk = torch.cat([chunk, padding], dim=0)
+        
+        return chunk, seq_len
            
     def forward(
         self,
@@ -691,11 +786,144 @@ class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        
-        moe_input_buffer = torch.empty_like(hidden_states)
-        moe_layer = self.mlp
+        seq_len, hidden_dim = hidden_states.shape
+        print("shape:", hidden_states.shape)
+        print("seq_len:", seq_len)
+
+        if isinstance(self.mlp, PipeDeepseekV2MoE) and PIPE_ON:
+            # FoldInfer
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_push(
+                    f"DeepseekV2DecoderLayer {self.layer_idx} MLP forward")
+
+            event_start = torch.cuda.Event(enable_timing=True)
+            event_end = torch.cuda.Event(enable_timing=True)
+            if seq_len != 256:
+                event_start.record()
+
+            moe_input_buffer = torch.empty_like(hidden_states)
+            moe_layer = self.mlp
+
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+                      
+            # Prepare chunks with proper handling of non-divisible seq_len
+            # Use tensor_split for even distribution when seq_len is not divisible by moe_pipe_degree
+            hidden_states_chunks = torch.tensor_split(hidden_states, self.mlp.moe_pipe_degree, dim=0)
+            residual_output_chunks = torch.tensor_split(residual, self.mlp.moe_pipe_degree, dim=0)
+            
+            # Pipeline cache
+            # Note: chunk sizes may vary when seq_len is not divisible by moe_pipe_degree
+            moe_input_buffer = torch.empty_like(hidden_states)
+            moe_input_buffer_start = 0
+            moe_input_buffer_end = 0
+            # store the outputs of each chunk, total size is moe_pipe_degree
+            mlp_output_list = [None] * self.mlp.moe_pipe_degree
+            residual_list = [None] * self.mlp.moe_pipe_degree
+
+            # Multi-cuda-stream support, implement init stream here
+
+            for chunk_idx in range(self.mlp.moe_pipe_degree):
+                print("=====================================================")
+                print(f"Processing chunk {chunk_idx}")
+
+                with torch.cuda.stream(self.streams[0]):
+                    hidden_states = hidden_states_chunks[chunk_idx]
+                    residual = residual_output_chunks[chunk_idx]
+                    chunk_seq_len = hidden_states.shape[0]
+
+                    # Pad chunk to alignment
+                    #hidden_states, seq_len = self.pad_chunk_to_alignment(hidden_states, 32)
+                    if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                        torch.cuda.nvtx.range_push(
+                            f"MLA forward")
+                    hidden_states = self.self_attn.forward_chunk(
+                        positions=positions[:chunk_seq_len],  # Adjust positions for chunk size
+                        hidden_states=hidden_states,
+                        chunk_id=chunk_idx,
+                        moe_pipe_degree=self.mlp.moe_pipe_degree,
+                    )
+                    if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                        torch.cuda.nvtx.range_pop()
+
+                    # convert back the original seq_len
+                    # if hidden_states.shape[0] != seq_len:
+                    #     hidden_states = hidden_states[:seq_len, :]
+                    
+                    if hidden_states.dtype == torch.float16:
+                        # This is a special case to avoid FP16 overflow
+                        hidden_states *= 1. / self.routed_scaling_factor
+                    
+                    # Post-attention layernorm, combine with residual
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual)
+
+                    # chunk_seq_len = seq_len // self.mlp.moe_pipe_degree
+                    # moe_input_buffer[moe_input_buffer_end:moe_input_buffer_end+chunk_seq_len] = hidden_states
+                    # moe_input_buffer_end += chunk_seq_len
+
+                    # moe_input = moe_input_buffer[moe_input_buffer_start:moe_input_buffer_start + moe_chunk_size].clone()
+                    # moe_input_buffer_start += moe_chunk_size
+                    moe_input = hidden_states
+                    
+                    # Lock for per chunk
+                    moe_layer.gating(moe_input, residual, chunk_idx)
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 0].record()
+                    torch.cuda.synchronize()
+                
+                with torch.cuda.stream(self.streams[1]):
+                    # Wait for gating to finish
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 0].wait()
+                    moe_layer.dispatch(chunk_idx)
+                    # Wait for gating and dispatch to finish
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 1].record()
+
+            for chunk_idx in range(self.mlp.moe_pipe_degree):
+                print("=====================================================")
+                print(f"Processing moe chunk {chunk_idx}")
+                # Wait for gating and dispatch to finish
+                with torch.cuda.stream(self.streams[0]):
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 1].wait()
+                    moe_layer.MoEFwd(chunk_idx)
+                    # Wait for MoEFwd to finish
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 2].record()
+                
+                with torch.cuda.stream(self.streams[1]):
+                    # Wait for MoEFwd to finish
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 2].wait()
+                    moe_layer.combine(chunk_idx)
+                    # Wait for all combine to finish
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 3].record()
+
+            for chunk_idx in range(self.mlp.moe_pipe_degree):
+                # Wait for combine to finish
+                self.events[chunk_idx + self.mlp.moe_pipe_degree * 3].wait()
+                hidden_states, residual = moe_layer.post_MoE(chunk_idx)
+                mlp_output_list[chunk_idx] = hidden_states
+                residual_list[chunk_idx] = residual         
+            hidden_states = torch.cat(mlp_output_list, dim=0)
+            residual = torch.cat(residual_list, dim=0)
+            print("result", hidden_states.shape, residual.shape)
+
+            if seq_len != 256:
+                event_end.record()
+                torch.cuda.synchronize()
+                print(f"forward time: {event_start.elapsed_time(event_end)} ms")
+            
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_pop()
+            return hidden_states, residual
 
         # Self Attention
+        if isinstance(self.mlp, PipeDeepseekV2MoE) and seq_len != 256 and seq_len != 1:
+            event_start = torch.cuda.Event(enable_timing=True)
+            event_end = torch.cuda.Event(enable_timing=True)
+            event_start.record()
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -706,36 +934,34 @@ class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
         )
-
         
 
         # Fully Connected
-        if isinstance(self.mlp, PipeDeepseekV2MoE) and \
-            hidden_states.dtype == torch.float16:
+        if hidden_states.dtype == torch.float16:
             # This is a special case to avoid FP16 overflow
             hidden_states *= 1. / self.routed_scaling_factor
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
-        if isinstance(self.mlp, PipeDeepseekV2MoE) and PIPE_ON:
-            # FoldInfer
-            moe_inputs = hidden_states
-            chunk_idx = 0  # You can pass different chunk_idx based on the pipeline
-
-            moe_layer.gating(moe_inputs, chunk_idx)
-            moe_layer.dispatch(chunk_idx)
-            moe_layer.MoEFwd(chunk_idx)
-            moe_layer.combine(chunk_idx)
-            hidden_states = moe_layer.post_MoE(chunk_idx)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+            torch.cuda.nvtx.range_push(
+                f"DeepseekV2DecoderLayer {self.layer_idx} MLP forward")
+        hidden_states = self.mlp(hidden_states)
+        if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+            torch.cuda.nvtx.range_pop()
 
         if isinstance(self.mlp, DeepseekV2MLP) and \
             hidden_states.dtype == torch.float16:
             # This is a special case to avoid FP16 overflow
             hidden_states *= 1. / self.routed_scaling_factor
             residual *= 1. / self.routed_scaling_factor
+        if isinstance(self.mlp, PipeDeepseekV2MoE) and seq_len != 256 and seq_len != 1:
+            event_end.record()
+            torch.cuda.synchronize()
+            print(f"forward time: {event_start.elapsed_time(event_end)} ms") 
+        print("result", hidden_states.shape, residual.shape)
+        
         return hidden_states, residual
 
 
@@ -806,8 +1032,9 @@ class DeepseekV2Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for layer in self.layers[self.start_layer:self.end_layer]:
+            print("Processing layer:", layer.layer_idx)
             hidden_states, residual = layer(positions, hidden_states, residual)
-
+        torch.cuda.synchronize()
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

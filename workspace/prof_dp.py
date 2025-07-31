@@ -87,7 +87,7 @@ def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
     if input_file and os.path.exists(input_file):
         with open(input_file, 'r', encoding='utf-8') as file:
             file_content = file.read()
-        prompts = [file_content]
+        prompts = [file_content, file_content, file_content, file_content]
     else:
         # Sample prompts.
         prompts = [
@@ -160,15 +160,17 @@ if __name__ == "__main__":
     assert dp_size % node_size == 0, "dp_size should be divisible by node_size"
     dp_per_node = dp_size // node_size
 
-    from multiprocessing import Process
+    from multiprocessing import Process, Queue
 
     procs = []
+
+
     for local_dp_rank, global_dp_rank in enumerate(
             range(node_rank * dp_per_node, (node_rank + 1) * dp_per_node)):
         proc = Process(target=main,
-                       args=(args.model, dp_size, local_dp_rank,
-                             global_dp_rank, dp_master_ip, dp_master_port,
-                             tp_size, args.input_file))
+                    args=(args.model, dp_size, local_dp_rank,
+                            global_dp_rank, dp_master_ip, dp_master_port,
+                            tp_size, args.input_file))
         proc.start()
         procs.append(proc)
     exit_code = 0
@@ -176,7 +178,7 @@ if __name__ == "__main__":
         proc.join(timeout=300)
         if proc.exitcode is None:
             print(f"Killing process {proc.pid} that "
-                  f"didn't stop within 5 minutes.")
+                f"didn't stop within 5 minutes.")
             proc.kill()
             exit_code = 1
         elif proc.exitcode:

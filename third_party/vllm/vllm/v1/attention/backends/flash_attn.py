@@ -487,6 +487,7 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        chunk_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 

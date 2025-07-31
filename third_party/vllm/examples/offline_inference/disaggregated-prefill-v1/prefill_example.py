@@ -6,10 +6,10 @@ from vllm.config import KVTransferConfig
 context = "Hi " * 1000
 context2 = "Hey " * 500
 prompts = [
-    context + "Hello, my name is",
-    context + "The capital of France is",
-    context2 + "Your name is",
-    context2 + "The capital of China is",
+    "Hello, my name is" * 30,
+    "The capital of France is" * 30,
+    "Your name is" * 30,
+    "The capital of China is" * 30,
 ]
 
 sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
@@ -17,6 +17,7 @@ sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
 llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct",
           enforce_eager=True,
           gpu_memory_utilization=0.8,
+          enable_prefix_caching=False,
           kv_transfer_config=KVTransferConfig.from_cli(
               '{"kv_connector":"SharedStorageConnector","kv_role":"kv_both", '
               '"kv_connector_extra_config": '

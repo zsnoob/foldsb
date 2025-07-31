@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
 
@@ -32,7 +33,7 @@ if current_platform.is_tpu():
     from .moe_torch_iterative import fused_moe as fused_moe_pallas
 else:
     fused_moe_pallas = None  # type: ignore
-import nvtx
+import os
 logger = init_logger(__name__)
 
 
@@ -844,6 +845,38 @@ class FusedMoE(torch.nn.Module):
 
         return buffer
 
+    def _calculate_dynamic_cu_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Calculate cumulative tokens across DP ranks based on actual tensor sizes.
+        
+        This method ensures proper alignment when token counts vary across ranks,
+        especially handling odd numbers and uneven distributions.
+        """
+        local_tokens = hidden_states.size(0)
+        
+        # Gather actual token counts from all ranks
+        token_counts = torch.zeros(get_dp_group().world_size, 
+                                 dtype=torch.int32, 
+                                 device='cpu')
+        token_counts[self.dp_rank] = local_tokens
+        
+        # Use standard PyTorch distributed to synchronize counts
+        dist.all_reduce(token_counts, group=get_dp_group().cpu_group)
+        
+        # Convert to cumulative sum
+        cu_tokens = torch.cumsum(token_counts, dim=0)
+        
+        # Validation: ensure total matches expected
+        total_tokens = cu_tokens[-1].item()
+        if total_tokens == 0:
+            # Fallback to original if no valid tokens
+            return get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
+            
+        # Debug information for alignment issues
+        print(f"Dynamic cu_tokens calculation: local={local_tokens}, "
+              f"all_counts={token_counts.tolist()}, cu_tokens={cu_tokens.tolist()}")
+        
+        return cu_tokens
+
     def forward(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
         if self.use_direct_call:
@@ -858,8 +891,16 @@ class FusedMoE(torch.nn.Module):
         if self.ep_rank == 0:
             torch.cuda.nvtx.range_push("FusedMoE dispatch")
         if self.dp_size > 1:
-            self.cu_tokens_across_dp_cpu = get_forward_context(
+            original_cu_tokens = get_forward_context(
             ).dp_metadata.cu_tokens_across_dp_cpu
+            
+            # For pipeline mode, calculate effective cu_tokens based on actual tensor sizes
+            if os.getenv('PIPE_ON', '0') == '1':
+                self.cu_tokens_across_dp_cpu = self._calculate_dynamic_cu_tokens(hidden_states)
+            else:
+                self.cu_tokens_across_dp_cpu = original_cu_tokens
+                
+            print(f"dispatch cu_tokens: {self.cu_tokens_across_dp_cpu}, tensor size: {hidden_states.size(0)}")
 
             hidden_states = self.naive_multicast(hidden_states,
                                                  self.cu_tokens_across_dp_cpu)
@@ -872,6 +913,8 @@ class FusedMoE(torch.nn.Module):
     
     def MoEFwd(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_push("FusedMoE GEMM")
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -888,6 +931,8 @@ class FusedMoE(torch.nn.Module):
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
         )
+        if self.ep_rank == 0:
+            torch.cuda.nvtx.range_pop()
 
         return final_hidden_states
         
@@ -895,9 +940,18 @@ class FusedMoE(torch.nn.Module):
         if self.ep_rank == 0:
             torch.cuda.nvtx.range_push("FusedMoE combine")
         if self.dp_size > 1:
-            start = 0 if self.dp_rank == 0 else self.cu_tokens_across_dp_cpu[
+            # Use the same cu_tokens calculation as dispatch for consistency
+            cu_tokens_across_dp_cpu = getattr(self, 'cu_tokens_across_dp_cpu', None)
+            if cu_tokens_across_dp_cpu is None:
+                if os.getenv('PIPE_ON', '0') == '1':
+                    cu_tokens_across_dp_cpu = self._calculate_dynamic_cu_tokens_for_combine(final_hidden_states)
+                else:
+                    cu_tokens_across_dp_cpu = get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
+
+            print(f"combine cu_tokens: {cu_tokens_across_dp_cpu}, tensor size: {final_hidden_states.size(0)}")
+            start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
                 self.dp_rank - 1]
-            end = self.cu_tokens_across_dp_cpu[self.dp_rank]
+            end = cu_tokens_across_dp_cpu[self.dp_rank]
 
             all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
             final_hidden_states = all_hidden_states[start:end, :]
@@ -919,10 +973,13 @@ class FusedMoE(torch.nn.Module):
             cu_tokens_across_dp_cpu = get_forward_context(
             ).dp_metadata.cu_tokens_across_dp_cpu
 
+            print("==========dispatch", hidden_states.shape)
+
             hidden_states = self.naive_multicast(hidden_states,
                                                  cu_tokens_across_dp_cpu)
             router_logits = self.naive_multicast(router_logits,
                                                  cu_tokens_across_dp_cpu)
+            print("==========after dispatch", hidden_states.shape)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -944,12 +1001,15 @@ class FusedMoE(torch.nn.Module):
         )
 
         if self.dp_size > 1:
+            print("==========combine", final_hidden_states.shape)
             start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
                 self.dp_rank - 1]
             end = cu_tokens_across_dp_cpu[self.dp_rank]
 
             all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
             final_hidden_states = all_hidden_states[start:end, :]
+
+            print("==========after combine", final_hidden_states.shape)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

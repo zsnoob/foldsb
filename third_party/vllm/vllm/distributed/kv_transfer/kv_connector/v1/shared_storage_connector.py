@@ -80,6 +80,7 @@ class SharedStorageConnector(KVConnectorBase_V1):
         transfer_config = vllm_config.kv_transfer_config
         self._storage_path = transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp")
+        self.counter = 0
         logger.info(vllm_config.kv_transfer_config)
         logger.info("Shared storage path is %s", self._storage_path)
 
@@ -208,8 +209,13 @@ class SharedStorageConnector(KVConnectorBase_V1):
                                                                ...]
 
         connector_metadata = self._get_connector_metadata()
+        print("草泥马")
+        print(len(connector_metadata.requests))
+        self.counter += 1
+        print(self.counter)
         assert isinstance(connector_metadata, SharedStorageConnectorMetadata)
         for request in connector_metadata.requests:
+            print(request.is_store)
             if request.is_store:
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids)
@@ -334,13 +340,15 @@ class SharedStorageConnector(KVConnectorBase_V1):
     # ==============================
     # Helper functions
     # ==============================
-
+    
+    # check here
     def _found_match_for_request(
         self,
         request: "Request",
     ) -> bool:
         """Check if the cache is hit for the request.
         """
+        # former n - 1 tokens have cached KV, where n is the number of tokens
         num_tokens_to_check = align_to_block_size(
             len(request.prompt_token_ids) - 1, self._block_size)
         foldername = self._generate_foldername_debug(torch.tensor(
